@@ -21,6 +21,7 @@ class CallRecordingService : Service() {
     private val TAG = "CallRecordingService"
     private val CHANNEL_ID = "SmartCallAgentChannel"
     private var fileObservers = mutableListOf<FileObserver>()
+    private var pollingTimer: java.util.Timer? = null
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
@@ -64,6 +65,17 @@ class CallRecordingService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        
+        pollingTimer?.let {
+            try {
+                it.cancel()
+                Log.d(TAG, "[WATCHER] Polling timer cancelled successfully.")
+            } catch (e: Exception) {
+                Log.e(TAG, "[WATCHER] Error cancelling polling timer", e)
+            }
+        }
+        pollingTimer = null
+
         fileObservers.forEach { 
             try {
                 it.stopWatching()
@@ -182,6 +194,21 @@ class CallRecordingService : Service() {
         }
     }
 
+    private fun startPolling() {
+        Log.d(TAG, "[POLLING] Initializing background query poller (15s interval)...")
+        pollingTimer = java.util.Timer()
+        pollingTimer?.scheduleAtFixedRate(object : java.util.TimerTask() {
+            override fun run() {
+                try {
+                    Log.d(TAG, "[POLLING] Executing periodic MediaStore validation query...")
+                    checkLatestAudioFile()
+                } catch (e: Exception) {
+                    Log.e(TAG, "[POLLING] Periodic validation failed", e)
+                }
+            }
+        }, 5000, 15000) // 5 seconds initial delay, 15 seconds period
+    }
+
     private fun startWatching() {
         Log.d(TAG, "[WATCHER] Starting FileObservers for real-time local file system events")
         
@@ -223,6 +250,9 @@ class CallRecordingService : Service() {
         } catch (e: Exception) {
             Log.e(TAG, "[WATCHER] CRITICAL ERROR: Failed to register ContentObserver", e)
         }
+
+        // Start periodic background scanner polling as second safety tier
+        startPolling()
     }
 
     private fun checkLatestAudioFile() {
@@ -233,7 +263,8 @@ class CallRecordingService : Service() {
             android.provider.MediaStore.Audio.Media.DATE_ADDED,
             android.provider.MediaStore.Audio.Media.DISPLAY_NAME
         )
-        val sortOrder = "${android.provider.MediaStore.Audio.Media.DATE_ADDED} DESC"
+        // Sort by Database auto-increment ID DESC to guarantee physical insertion order sorting
+        val sortOrder = "${android.provider.MediaStore.Audio.Media._ID} DESC"
         
         try {
             contentResolver.query(
@@ -262,20 +293,33 @@ class CallRecordingService : Service() {
                     val dateAdded = cursor.getLong(dateAddedIndex)
                     val displayName = cursor.getString(nameIndex) ?: "recording.m4a"
                     
-                    val ageSeconds = currentTimeSeconds - dateAdded
-                    val isRecent = ageSeconds < 600 // 10 minutes limit
+                    // Normalize dates (seconds representation)
+                    var fileDate = dateAdded
+                    if (fileDate > 999999999999L) { // Safe guard: handle millisecond timestamps
+                        fileDate /= 1000
+                    }
+                    
+                    val ageSeconds = currentTimeSeconds - fileDate
+                    // Substantially relax timing filter to 24 hours to handle latency/clock drift, and use Math.abs
+                    val isRecent = Math.abs(ageSeconds) < 86400
                     val isAlreadyUploaded = uploadedFiles.contains(filePath)
                     
                     Log.d(TAG, "[SCANNER] Item #$count -> ID: $id, Name: $displayName, Path: $filePath, Age: ${ageSeconds}s, Recent: $isRecent, AlreadyUploaded: $isAlreadyUploaded")
                     
                     if (isRecent && !isAlreadyUploaded) {
-                        // Check broad matching keywords: Call, Record (covers recordings/recorder/recording), 통화, 녹음, Voice, Audio
+                        // Check broad matching keywords on both path and displayName
                         if (filePath.contains("Call", ignoreCase = true) || 
                             filePath.contains("Record", ignoreCase = true) || 
                             filePath.contains("통화", ignoreCase = true) || 
                             filePath.contains("녹음", ignoreCase = true) || 
                             filePath.contains("Voice", ignoreCase = true) || 
-                            filePath.contains("Audio", ignoreCase = true)) {
+                            filePath.contains("Audio", ignoreCase = true) ||
+                            displayName.contains("Call", ignoreCase = true) ||
+                            displayName.contains("Record", ignoreCase = true) ||
+                            displayName.contains("통화", ignoreCase = true) ||
+                            displayName.contains("녹음", ignoreCase = true) ||
+                            displayName.contains("Voice", ignoreCase = true) ||
+                            displayName.contains("Audio", ignoreCase = true)) {
                             
                             Log.d(TAG, "[SCANNER] [MATCH_SUCCESS] Found new target call recording: $displayName (Path: $filePath)")
                             
@@ -289,14 +333,12 @@ class CallRecordingService : Service() {
                             sharedPrefs.edit().putStringSet("uploaded_files", uploadedFiles).apply()
                             Log.d(TAG, "[SCANNER] Saved file to SharedPreferences uploaded set to prevent duplicate uploads.")
                             
-                            // Wait 3 seconds to ensure file write is fully completed, then copy and upload
-                            Log.d(TAG, "[SCANNER] Waiting 3 seconds for file handles to close before processing upload...")
+                            // Wait 2 seconds to ensure file write is fully completed, then copy and upload
+                            Log.d(TAG, "[SCANNER] Waiting 2 seconds for file handles to close before processing upload...")
+                            val finalFilePath = filePath
                             android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                                uploadFile(contentUri, displayName, filePath)
-                            }, 3000)
-                            
-                            // Break to only process the single newest file in this change event
-                            break
+                                uploadFile(contentUri, displayName, finalFilePath)
+                            }, 2000)
                         } else {
                             Log.d(TAG, "[SCANNER] Scanned file skipped (does not match naming filter keywords).")
                         }
