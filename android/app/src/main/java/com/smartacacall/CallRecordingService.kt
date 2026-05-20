@@ -64,8 +64,24 @@ class CallRecordingService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
-        fileObservers.forEach { it.stopWatching() }
+        fileObservers.forEach { 
+            try {
+                it.stopWatching()
+                Log.d(TAG, "[WATCHER] Stopped FileObserver.")
+            } catch (e: Exception) {
+                Log.e(TAG, "[WATCHER] Error stopping FileObserver", e)
+            }
+        }
         fileObservers.clear()
+        
+        contentObserver?.let {
+            try {
+                contentResolver.unregisterContentObserver(it)
+                Log.d(TAG, "[WATCHER] Unregistered ContentObserver.")
+            } catch (e: Exception) {
+                Log.e(TAG, "[WATCHER] Error unregistering ContentObserver", e)
+            }
+        }
     }
 
     private fun createNotificationChannel() {
@@ -83,12 +99,116 @@ class CallRecordingService : Service() {
     private var contentObserver: android.database.ContentObserver? = null
     private var lastUploadedFile: String? = null
 
+    private fun createFileObserver(path: String): FileObserver? {
+        val dir = File(path)
+        if (!dir.exists()) {
+            Log.d(TAG, "[FILE_OBSERVER] Directory does not exist, attempting to create: $path")
+            try {
+                dir.mkdirs()
+            } catch (e: Exception) {
+                Log.e(TAG, "[FILE_OBSERVER] Failed to create directory: $path", e)
+            }
+        }
+        
+        Log.d(TAG, "[FILE_OBSERVER] Initializing FileObserver for path: $path")
+        
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            object : FileObserver(dir, FileObserver.CLOSE_WRITE) {
+                override fun onEvent(event: Int, fileName: String?) {
+                    if (fileName != null && (event and FileObserver.CLOSE_WRITE) != 0) {
+                        handleFileCreated(path, fileName)
+                    }
+                }
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            object : FileObserver(path, FileObserver.CLOSE_WRITE) {
+                override fun onEvent(event: Int, fileName: String?) {
+                    if (fileName != null && (event and FileObserver.CLOSE_WRITE) != 0) {
+                        handleFileCreated(path, fileName)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun handleFileCreated(directory: String, fileName: String) {
+        val fullPath = File(directory, fileName).absolutePath
+        Log.d(TAG, "[FILE_OBSERVER] Event CLOSE_WRITE captured. Detected new physical file: $fullPath")
+        
+        val extension = fileName.substringAfterLast('.', "").lowercase()
+        val isAudioExtension = extension in arrayOf("m4a", "mp3", "amr", "3gp", "wav", "ogg", "aac", "flac")
+        
+        val isMatch = fileName.contains("Call", ignoreCase = true) || 
+                      fileName.contains("Record", ignoreCase = true) || 
+                      fileName.contains("통화", ignoreCase = true) || 
+                      fileName.contains("녹음", ignoreCase = true) || 
+                      fileName.contains("Voice", ignoreCase = true) || 
+                      fileName.contains("Audio", ignoreCase = true)
+                      
+        if (!isAudioExtension || !isMatch) {
+            Log.d(TAG, "[FILE_OBSERVER] File skipped. Extension check: $isAudioExtension, Keyword match: $isMatch. Path: $fullPath")
+            return
+        }
+        
+        val sharedPrefs = getSharedPreferences("SmartCallPrefs", MODE_PRIVATE)
+        val uploadedFiles = HashSet(sharedPrefs.getStringSet("uploaded_files", emptySet()) ?: emptySet())
+        
+        if (uploadedFiles.contains(fullPath)) {
+            Log.d(TAG, "[FILE_OBSERVER] File already processed and uploaded: $fullPath")
+            return
+        }
+        
+        Log.d(TAG, "[FILE_OBSERVER] Found target recording: $fileName. Requesting immediate MediaScanner force-scan...")
+        
+        // Prevent double upload by logging to SharedPreferences immediately
+        uploadedFiles.add(fullPath)
+        sharedPrefs.edit().putStringSet("uploaded_files", uploadedFiles).apply()
+        Log.d(TAG, "[FILE_OBSERVER] Logged file path to SharedPreferences to block duplicates.")
+        
+        // Force scan physical file immediately to generate Content Uri
+        android.media.MediaScannerConnection.scanFile(
+            this,
+            arrayOf(fullPath),
+            null
+        ) { scanPath, uri ->
+            Log.d(TAG, "[MEDIA_SCANNER] Scan completed for path: $scanPath -> Content Uri: $uri")
+            if (uri != null) {
+                Log.d(TAG, "[MEDIA_SCANNER] Triggering direct upload with generated Uri.")
+                uploadFile(uri, fileName, scanPath)
+            } else {
+                Log.e(TAG, "[MEDIA_SCANNER] CRITICAL: Generated Uri is null for $scanPath! Fallback ContentObserver will check this later.")
+            }
+        }
+    }
+
     private fun startWatching() {
-        Log.d(TAG, "[WATCHER] Starting MediaStore ContentObserver for Android 10+ compatibility")
+        Log.d(TAG, "[WATCHER] Starting FileObservers for real-time local file system events")
+        
+        val pathsToWatch = arrayOf(
+            File(Environment.getExternalStorageDirectory(), "Call").absolutePath,
+            File(Environment.getExternalStorageDirectory(), "Recordings/Call").absolutePath,
+            File(Environment.getExternalStorageDirectory(), "Recordings").absolutePath
+        )
+        
+        for (path in pathsToWatch) {
+            try {
+                val observer = createFileObserver(path)
+                if (observer != null) {
+                    observer.startWatching()
+                    fileObservers.add(observer)
+                    Log.d(TAG, "[WATCHER] Successfully started watching folder: $path")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "[WATCHER] Failed to start FileObserver for path: $path", e)
+            }
+        }
+
+        Log.d(TAG, "[WATCHER] Starting MediaStore ContentObserver for Android 10+ compatibility as fallback")
         contentObserver = object : android.database.ContentObserver(android.os.Handler(android.os.Looper.getMainLooper())) {
             override fun onChange(selfChange: Boolean, uri: android.net.Uri?) {
                 super.onChange(selfChange, uri)
-                Log.d(TAG, "[WATCHER] MediaStore changed event received. Uri: $uri")
+                Log.d(TAG, "[WATCHER] MediaStore changed event received (fallback). Uri: $uri")
                 checkLatestAudioFile()
             }
         }
