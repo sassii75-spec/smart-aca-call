@@ -1,6 +1,7 @@
 package com.smartacacall
 
 import android.app.*
+import android.content.ContentUris
 import android.content.Intent
 import android.os.Build
 import android.os.Environment
@@ -35,6 +36,7 @@ class CallRecordingService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         academyId = intent?.getStringExtra("ACADEMY_ID") ?: "sa_academy"
+        Log.d(TAG, "[AGENT_START] onStartCommand started. Academy ID: $academyId")
         
         val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Smart Call Agent 실행 중")
@@ -42,7 +44,15 @@ class CallRecordingService : Service() {
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .build()
 
-        startForeground(1, notification)
+        // Android 14+ (API 34+) foreground service type requirement
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            Log.d(TAG, "[AGENT_START] Running startForeground with FOREGROUND_SERVICE_TYPE_DATA_SYNC for API Q+")
+            startForeground(1, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        } else {
+            Log.d(TAG, "[AGENT_START] Running standard startForeground for API < Q")
+            startForeground(1, notification)
+        }
+        
         startWatching()
 
         return START_STICKY
@@ -74,11 +84,11 @@ class CallRecordingService : Service() {
     private var lastUploadedFile: String? = null
 
     private fun startWatching() {
-        Log.d(TAG, "Starting MediaStore ContentObserver for Android 11+ compatibility")
+        Log.d(TAG, "[WATCHER] Starting MediaStore ContentObserver for Android 10+ compatibility")
         contentObserver = object : android.database.ContentObserver(android.os.Handler(android.os.Looper.getMainLooper())) {
             override fun onChange(selfChange: Boolean, uri: android.net.Uri?) {
                 super.onChange(selfChange, uri)
-                Log.d(TAG, "MediaStore changed: $uri")
+                Log.d(TAG, "[WATCHER] MediaStore changed event received. Uri: $uri")
                 checkLatestAudioFile()
             }
         }
@@ -89,16 +99,19 @@ class CallRecordingService : Service() {
                 true,
                 contentObserver!!
             )
-            Log.d(TAG, "Successfully registered MediaStore observer.")
+            Log.d(TAG, "[WATCHER] Successfully registered ContentObserver for EXTERNAL_CONTENT_URI")
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to register ContentObserver", e)
+            Log.e(TAG, "[WATCHER] CRITICAL ERROR: Failed to register ContentObserver", e)
         }
     }
 
     private fun checkLatestAudioFile() {
+        Log.d(TAG, "[SCANNER] Commencing scan of latest MediaStore audio files...")
         val projection = arrayOf(
+            android.provider.MediaStore.Audio.Media._ID,
             android.provider.MediaStore.Audio.Media.DATA, 
-            android.provider.MediaStore.Audio.Media.DATE_ADDED
+            android.provider.MediaStore.Audio.Media.DATE_ADDED,
+            android.provider.MediaStore.Audio.Media.DISPLAY_NAME
         )
         val sortOrder = "${android.provider.MediaStore.Audio.Media.DATE_ADDED} DESC"
         
@@ -110,73 +123,104 @@ class CallRecordingService : Service() {
                 null,
                 sortOrder
             )?.use { cursor ->
+                val idIndex = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media._ID)
                 val dataIndex = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.DATA)
                 val dateAddedIndex = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.DATE_ADDED)
+                val nameIndex = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.DISPLAY_NAME)
                 
                 var count = 0
                 val sharedPrefs = getSharedPreferences("SmartCallPrefs", MODE_PRIVATE)
                 val uploadedFiles = HashSet(sharedPrefs.getStringSet("uploaded_files", emptySet()) ?: emptySet())
                 val currentTimeSeconds = System.currentTimeMillis() / 1000
                 
+                Log.d(TAG, "[SCANNER] Scanned records count: ${cursor.count}. Checking top 10 files...")
+                
                 while (cursor.moveToNext() && count < 10) {
                     count++
-                    val filePath = cursor.getString(dataIndex) ?: continue
+                    val id = cursor.getLong(idIndex)
+                    val filePath = cursor.getString(dataIndex) ?: "unknown_path"
                     val dateAdded = cursor.getLong(dateAddedIndex)
+                    val displayName = cursor.getString(nameIndex) ?: "recording.m4a"
                     
-                    // 1. 최근 10분(600초) 이내에 추가된 파일인지 확인 (바로 끝난 녹음 감지용)
-                    val isRecent = (currentTimeSeconds - dateAdded) < 600
-                    
-                    // 2. 이미 업로드된 파일이 아닌지 확인
+                    val ageSeconds = currentTimeSeconds - dateAdded
+                    val isRecent = ageSeconds < 600 // 10 minutes limit
                     val isAlreadyUploaded = uploadedFiles.contains(filePath)
                     
+                    Log.d(TAG, "[SCANNER] Item #$count -> ID: $id, Name: $displayName, Path: $filePath, Age: ${ageSeconds}s, Recent: $isRecent, AlreadyUploaded: $isAlreadyUploaded")
+                    
                     if (isRecent && !isAlreadyUploaded) {
-                        // 3. 파일명 매칭 검사
+                        // Check broad matching keywords: Call, Record (covers recordings/recorder/recording), 통화, 녹음, Voice, Audio
                         if (filePath.contains("Call", ignoreCase = true) || 
-                            filePath.contains("Recordings", ignoreCase = true) || 
+                            filePath.contains("Record", ignoreCase = true) || 
                             filePath.contains("통화", ignoreCase = true) || 
                             filePath.contains("녹음", ignoreCase = true) || 
                             filePath.contains("Voice", ignoreCase = true) || 
                             filePath.contains("Audio", ignoreCase = true)) {
                             
-                            Log.d(TAG, "Found new recording matching filter: $filePath (Added ${currentTimeSeconds - dateAdded}s ago)")
+                            Log.d(TAG, "[SCANNER] [MATCH_SUCCESS] Found new target call recording: $displayName (Path: $filePath)")
                             
-                            // 중복 업로드 방지를 위해 즉시 추가 후 저장
+                            val contentUri = android.content.ContentUris.withAppendedId(
+                                android.provider.MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                                id
+                            )
+                            
+                            // Prevent double upload by logging to SharedPreferences immediately
                             uploadedFiles.add(filePath)
                             sharedPrefs.edit().putStringSet("uploaded_files", uploadedFiles).apply()
+                            Log.d(TAG, "[SCANNER] Saved file to SharedPreferences uploaded set to prevent duplicate uploads.")
                             
-                            // 파일 쓰기가 완료될 시간을 주기 위해 3초 대기 후 업로드
+                            // Wait 3 seconds to ensure file write is fully completed, then copy and upload
+                            Log.d(TAG, "[SCANNER] Waiting 3 seconds for file handles to close before processing upload...")
                             android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                                uploadFile(filePath)
+                                uploadFile(contentUri, displayName, filePath)
                             }, 3000)
                             
-                            // 한 번의 감지 이벤트에서는 가장 최근의 1개 파일만 업로드하도록 탈출
+                            // Break to only process the single newest file in this change event
                             break
+                        } else {
+                            Log.d(TAG, "[SCANNER] Scanned file skipped (does not match naming filter keywords).")
                         }
                     }
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error checking MediaStore", e)
+            Log.e(TAG, "[SCANNER] CRITICAL ERROR during MediaStore query scan", e)
         }
     }
 
-    private fun uploadFile(filePath: String) {
-        val file = File(filePath)
-        if (!file.exists()) return
-
-        // 파일명 한글 깨짐 및 특수문자, 극단적인 길이로 인한 서버 파싱 에러 방지를 위해 업로드 시 영문 안전한 파일명으로 변환
-        val extension = file.name.substringAfterLast('.', "m4a")
+    private fun uploadFile(contentUri: android.net.Uri, displayName: String, originalPath: String) {
+        val extension = displayName.substringAfterLast('.', "m4a")
         val safeFileName = "recording_${System.currentTimeMillis()}.$extension"
 
-        Log.d(TAG, "Uploading file: $filePath as $safeFileName to academy: $academyId")
+        Log.d(TAG, "[UPLOAD] Preparing Scoped Storage bypass copy. URI: $contentUri, Name: $displayName, SafeName: $safeFileName")
 
+        // 1. Copy Content URI to a secure cache file to bypass direct file access restrictions
+        val tempFile = File(cacheDir, safeFileName)
+        try {
+            Log.d(TAG, "[UPLOAD] Copying stream from ContentResolver to local cache file: ${tempFile.absolutePath}")
+            contentResolver.openInputStream(contentUri)?.use { inputStream ->
+                tempFile.outputStream().use { outputStream ->
+                    inputStream.copyTo(outputStream)
+                }
+            }
+            Log.d(TAG, "[UPLOAD] Copy complete. Cache file size: ${tempFile.length()} bytes")
+            if (tempFile.length() == 0L) {
+                Log.e(TAG, "[UPLOAD] WARNING: Copied cache file size is 0 bytes! Scoped Storage may be blocking this content Uri.")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "[UPLOAD] CRITICAL ERROR copying audio stream to cache", e)
+            return
+        }
+
+        // 2. Build multi-part network request
+        Log.d(TAG, "[UPLOAD] Preparing OkHttp request. Academy: $academyId, Server Endpoint: https://smart-call-ai-gamma.vercel.app/api/analyze")
         val requestBody = MultipartBody.Builder()
             .setType(MultipartBody.FORM)
             .addFormDataPart("academyId", academyId)
             .addFormDataPart(
                 "file",
                 safeFileName,
-                file.asRequestBody("audio/*".toMediaTypeOrNull())
+                tempFile.asRequestBody("audio/*".toMediaTypeOrNull())
             )
             .build()
 
@@ -185,14 +229,38 @@ class CallRecordingService : Service() {
             .post(requestBody)
             .build()
 
+        // 3. Dispatch Async Network Upload
+        Log.d(TAG, "[UPLOAD] Sending HTTP multipart post request async...")
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
-                Log.e(TAG, "Upload failed", e)
+                Log.e(TAG, "[UPLOAD] NETWORK FAILURE: Upload failed for $safeFileName", e)
+                try {
+                    val deleted = tempFile.delete()
+                    Log.d(TAG, "[UPLOAD] Cache cleanup: Deleted temp cache file: $deleted")
+                } catch (ex: Exception) {
+                    Log.w(TAG, "[UPLOAD] Failed to clean up temp file", ex)
+                }
             }
 
             override fun onResponse(call: Call, response: Response) {
-                Log.d(TAG, "Upload success: ${response.code}")
-                response.close()
+                val code = response.code
+                val isSuccess = response.isSuccessful
+                Log.d(TAG, "[UPLOAD] SERVER RESPONSE -> Code: $code, Success: $isSuccess")
+                try {
+                    val responseBody = response.body?.string() ?: ""
+                    Log.d(TAG, "[UPLOAD] SERVER RESPONSE BODY: $responseBody")
+                } catch (bodyEx: Exception) {
+                    Log.w(TAG, "[UPLOAD] Failed to read response body string", bodyEx)
+                } finally {
+                    response.close()
+                }
+                
+                try {
+                    val deleted = tempFile.delete()
+                    Log.d(TAG, "[UPLOAD] Cache cleanup: Deleted temp cache file: $deleted")
+                } catch (ex: Exception) {
+                    Log.w(TAG, "[UPLOAD] Failed to clean up temp file", ex)
+                }
             }
         })
     }
