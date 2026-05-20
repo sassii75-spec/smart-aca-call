@@ -81,8 +81,8 @@ function App(): React.JSX.Element {
   }
 
   return (
-    <SafeAreaView style={styles.container}>
-      <StatusBar barStyle="dark-content" backgroundColor="#ffffff" />
+    <View style={styles.container}>
+      <StatusBar barStyle="dark-content" backgroundColor="#ffffff" translucent={false} />
       <WebView
         ref={webviewRef}
         source={{ uri: TARGET_URL }}
@@ -97,7 +97,7 @@ function App(): React.JSX.Element {
           </View>
         )}
       />
-    </SafeAreaView>
+    </View>
   );
 }
 
