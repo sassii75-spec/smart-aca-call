@@ -146,7 +146,7 @@ class CallRecordingService : Service() {
             .build()
 
         val request = Request.Builder()
-            .url("https://smart-call-ai.vercel.app/api/analyze")
+            .url("https://smart-call-ai-gamma.vercel.app/api/analyze")
             .post(requestBody)
             .build()
 
