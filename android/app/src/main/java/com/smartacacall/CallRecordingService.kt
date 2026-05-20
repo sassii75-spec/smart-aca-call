@@ -96,7 +96,10 @@ class CallRecordingService : Service() {
     }
 
     private fun checkLatestAudioFile() {
-        val projection = arrayOf(android.provider.MediaStore.Audio.Media.DATA, android.provider.MediaStore.Audio.Media.DATE_ADDED)
+        val projection = arrayOf(
+            android.provider.MediaStore.Audio.Media.DATA, 
+            android.provider.MediaStore.Audio.Media.DATE_ADDED
+        )
         val sortOrder = "${android.provider.MediaStore.Audio.Media.DATE_ADDED} DESC"
         
         try {
@@ -107,24 +110,47 @@ class CallRecordingService : Service() {
                 null,
                 sortOrder
             )?.use { cursor ->
-                if (cursor.moveToFirst()) {
-                    val dataIndex = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.DATA)
-                    val filePath = cursor.getString(dataIndex)
+                val dataIndex = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.DATA)
+                val dateAddedIndex = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.DATE_ADDED)
+                
+                var count = 0
+                val sharedPrefs = getSharedPreferences("SmartCallPrefs", MODE_PRIVATE)
+                val uploadedFiles = HashSet(sharedPrefs.getStringSet("uploaded_files", emptySet()) ?: emptySet())
+                val currentTimeSeconds = System.currentTimeMillis() / 1000
+                
+                while (cursor.moveToNext() && count < 10) {
+                    count++
+                    val filePath = cursor.getString(dataIndex) ?: continue
+                    val dateAdded = cursor.getLong(dateAddedIndex)
                     
-                    if (filePath != null && filePath != lastUploadedFile) {
+                    // 1. 최근 10분(600초) 이내에 추가된 파일인지 확인 (바로 끝난 녹음 감지용)
+                    val isRecent = (currentTimeSeconds - dateAdded) < 600
+                    
+                    // 2. 이미 업로드된 파일이 아닌지 확인
+                    val isAlreadyUploaded = uploadedFiles.contains(filePath)
+                    
+                    if (isRecent && !isAlreadyUploaded) {
+                        // 3. 파일명 매칭 검사
                         if (filePath.contains("Call", ignoreCase = true) || 
                             filePath.contains("Recordings", ignoreCase = true) || 
                             filePath.contains("통화", ignoreCase = true) || 
                             filePath.contains("녹음", ignoreCase = true) || 
                             filePath.contains("Voice", ignoreCase = true) || 
                             filePath.contains("Audio", ignoreCase = true)) {
-                            Log.d(TAG, "Found new recording via MediaStore: $filePath")
-                            lastUploadedFile = filePath
+                            
+                            Log.d(TAG, "Found new recording matching filter: $filePath (Added ${currentTimeSeconds - dateAdded}s ago)")
+                            
+                            // 중복 업로드 방지를 위해 즉시 추가 후 저장
+                            uploadedFiles.add(filePath)
+                            sharedPrefs.edit().putStringSet("uploaded_files", uploadedFiles).apply()
                             
                             // 파일 쓰기가 완료될 시간을 주기 위해 3초 대기 후 업로드
                             android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
                                 uploadFile(filePath)
                             }, 3000)
+                            
+                            // 한 번의 감지 이벤트에서는 가장 최근의 1개 파일만 업로드하도록 탈출
+                            break
                         }
                     }
                 }
@@ -138,14 +164,18 @@ class CallRecordingService : Service() {
         val file = File(filePath)
         if (!file.exists()) return
 
-        Log.d(TAG, "Uploading file: $filePath to academy: $academyId")
+        // 파일명 한글 깨짐 및 특수문자, 극단적인 길이로 인한 서버 파싱 에러 방지를 위해 업로드 시 영문 안전한 파일명으로 변환
+        val extension = file.name.substringAfterLast('.', "m4a")
+        val safeFileName = "recording_${System.currentTimeMillis()}.$extension"
+
+        Log.d(TAG, "Uploading file: $filePath as $safeFileName to academy: $academyId")
 
         val requestBody = MultipartBody.Builder()
             .setType(MultipartBody.FORM)
             .addFormDataPart("academyId", academyId)
             .addFormDataPart(
                 "file",
-                file.name,
+                safeFileName,
                 file.asRequestBody("audio/*".toMediaTypeOrNull())
             )
             .build()
