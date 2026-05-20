@@ -70,30 +70,62 @@ class CallRecordingService : Service() {
         }
     }
 
-    private fun startWatching() {
-        // 삼성 갤럭시 및 일반 안드로이드 녹음 폴더 경로들
-        val paths = listOf(
-            Environment.getExternalStorageDirectory().absolutePath + "/Recordings/Call",
-            Environment.getExternalStorageDirectory().absolutePath + "/Music/Call",
-            Environment.getExternalStorageDirectory().absolutePath + "/Call"
-        )
+    private var contentObserver: android.database.ContentObserver? = null
+    private var lastUploadedFile: String? = null
 
-        for (path in paths) {
-            val dir = File(path)
-            if (dir.exists() && dir.isDirectory) {
-                Log.d(TAG, "Watching directory: $path")
-                val observer = object : FileObserver(path, CLOSE_WRITE) {
-                    override fun onEvent(event: Int, file: String?) {
-                        if (file != null && (file.endsWith(".m4a") || file.endsWith(".mp3") || file.endsWith(".amr"))) {
-                            val fullPath = "$path/$file"
-                            Log.d(TAG, "New recording detected: $fullPath")
-                            uploadFile(fullPath)
+    private fun startWatching() {
+        Log.d(TAG, "Starting MediaStore ContentObserver for Android 11+ compatibility")
+        contentObserver = object : android.database.ContentObserver(android.os.Handler(android.os.Looper.getMainLooper())) {
+            override fun onChange(selfChange: Boolean, uri: android.net.Uri?) {
+                super.onChange(selfChange, uri)
+                Log.d(TAG, "MediaStore changed: $uri")
+                checkLatestAudioFile()
+            }
+        }
+        
+        try {
+            contentResolver.registerContentObserver(
+                android.provider.MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                true,
+                contentObserver!!
+            )
+            Log.d(TAG, "Successfully registered MediaStore observer.")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to register ContentObserver", e)
+        }
+    }
+
+    private fun checkLatestAudioFile() {
+        val projection = arrayOf(android.provider.MediaStore.Audio.Media.DATA, android.provider.MediaStore.Audio.Media.DATE_ADDED)
+        val sortOrder = "${android.provider.MediaStore.Audio.Media.DATE_ADDED} DESC"
+        
+        try {
+            contentResolver.query(
+                android.provider.MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                projection,
+                null,
+                null,
+                sortOrder
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val dataIndex = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Audio.Media.DATA)
+                    val filePath = cursor.getString(dataIndex)
+                    
+                    if (filePath != null && filePath != lastUploadedFile) {
+                        if (filePath.contains("Call", ignoreCase = true) || filePath.contains("Recordings", ignoreCase = true)) {
+                            Log.d(TAG, "Found new recording via MediaStore: $filePath")
+                            lastUploadedFile = filePath
+                            
+                            // 파일 쓰기가 완료될 시간을 주기 위해 3초 대기 후 업로드
+                            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                                uploadFile(filePath)
+                            }, 3000)
                         }
                     }
                 }
-                observer.startWatching()
-                fileObservers.add(observer)
             }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error checking MediaStore", e)
         }
     }
 
