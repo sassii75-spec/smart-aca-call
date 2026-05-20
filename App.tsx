@@ -7,7 +7,8 @@ import {
   NativeModules,
   Alert,
   View,
-  ActivityIndicator
+  ActivityIndicator,
+  Platform
 } from 'react-native';
 import { WebView } from 'react-native-webview';
 
@@ -16,6 +17,11 @@ const { CallRecordingAgent } = NativeModules;
 // 하드코딩된 기본 학원 ID (향후 웹뷰와 통신하여 동적으로 변경 가능)
 const DEFAULT_ACADEMY_ID = 'sa_academy';
 const TARGET_URL = 'https://smart-call-ai.vercel.app/';
+
+// Bypasses Google OAuth 'disallowed_useragent' security policy in WebView by presenting standard browser user agents
+const USER_AGENT = Platform.OS === 'android'
+  ? 'Mozilla/5.0 (Linux; Android 13; SM-S901B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36'
+  : 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1';
 
 function App(): React.JSX.Element {
   const [isReady, setIsReady] = useState(false);
@@ -84,6 +90,7 @@ function App(): React.JSX.Element {
         javaScriptEnabled={true}
         domStorageEnabled={true}
         startInLoadingState={true}
+        userAgent={USER_AGENT}
         renderLoading={() => (
           <View style={styles.loadingContainer}>
             <ActivityIndicator size="large" color="#3B82F6" />
@@ -103,7 +110,7 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   loadingContainer: {
-    ...StyleSheet.absoluteFillObject,
+    ...StyleSheet.absoluteFill,
     backgroundColor: '#ffffff',
     justifyContent: 'center',
     alignItems: 'center',
