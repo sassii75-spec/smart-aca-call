@@ -112,7 +112,12 @@ class CallRecordingService : Service() {
                     val filePath = cursor.getString(dataIndex)
                     
                     if (filePath != null && filePath != lastUploadedFile) {
-                        if (filePath.contains("Call", ignoreCase = true) || filePath.contains("Recordings", ignoreCase = true)) {
+                        if (filePath.contains("Call", ignoreCase = true) || 
+                            filePath.contains("Recordings", ignoreCase = true) || 
+                            filePath.contains("통화", ignoreCase = true) || 
+                            filePath.contains("녹음", ignoreCase = true) || 
+                            filePath.contains("Voice", ignoreCase = true) || 
+                            filePath.contains("Audio", ignoreCase = true)) {
                             Log.d(TAG, "Found new recording via MediaStore: $filePath")
                             lastUploadedFile = filePath
                             
