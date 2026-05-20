@@ -16,7 +16,7 @@ const { CallRecordingAgent } = NativeModules;
 
 // 하드코딩된 기본 학원 ID (향후 웹뷰와 통신하여 동적으로 변경 가능)
 const DEFAULT_ACADEMY_ID = 'sa_academy';
-const TARGET_URL = 'https://smart-call-ai.vercel.app/';
+const TARGET_URL = 'https://smart-call-ai-gamma.vercel.app/';
 
 // Bypasses Google OAuth 'disallowed_useragent' security policy in WebView by presenting standard browser user agents
 const USER_AGENT = Platform.OS === 'android'
