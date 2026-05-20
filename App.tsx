@@ -15,7 +15,7 @@ const { CallRecordingAgent } = NativeModules;
 
 // 하드코딩된 기본 학원 ID (향후 웹뷰와 통신하여 동적으로 변경 가능)
 const DEFAULT_ACADEMY_ID = 'sa_academy';
-const TARGET_URL = 'https://smart-call-ai.vercel.app/admin';
+const TARGET_URL = 'https://smart-call-ai.vercel.app/';
 
 function App(): React.JSX.Element {
   const [isReady, setIsReady] = useState(false);
