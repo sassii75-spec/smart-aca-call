@@ -43,8 +43,12 @@ jobs:
       - name: Build Android Release APK
         run: cd android && ./gradlew assembleRelease
 
+      - name: Extract App Version
+        id: get_version
+        run: echo "VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_ENV
+
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: SmartACACall-release-apk
+          name: SmartACACall-v${{ env.VERSION }}-b${{ github.run_number }}
           path: android/app/build/outputs/apk/release/app-release.apk
