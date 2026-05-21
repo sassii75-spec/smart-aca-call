@@ -144,22 +144,50 @@ class CallRecordingService : Service() {
         }
     }
 
+    private fun isTargetCallRecording(filePath: String, displayName: String): Boolean {
+        val extension = displayName.substringAfterLast('.', "").lowercase()
+        val isAudio = extension in arrayOf("m4a", "mp3", "amr", "3gp", "wav", "ogg", "aac", "flac")
+        if (!isAudio) return false
+
+        // 1. 경로 검사 (기본 통화 녹음 저장 디렉토리인 경우 무조건 참)
+        val isCallFolder = filePath.contains("/Call", ignoreCase = true) || 
+                           filePath.contains("/Recordings", ignoreCase = true)
+        if (isCallFolder) {
+            Log.d(TAG, "[FILTER] Path matched call recordings folder: $filePath")
+            return true
+        }
+
+        // 2. 키워드 검사 (기존 규칙 유지)
+        val hasKeyword = displayName.contains("Call", ignoreCase = true) ||
+                         displayName.contains("Record", ignoreCase = true) ||
+                         displayName.contains("통화", ignoreCase = true) ||
+                         displayName.contains("녹음", ignoreCase = true) ||
+                         displayName.contains("Voice", ignoreCase = true) ||
+                         displayName.contains("Audio", ignoreCase = true)
+        if (hasKeyword) {
+            Log.d(TAG, "[FILTER] Display name matched keyword: $displayName")
+            return true
+        }
+
+        // 3. 패턴 추론 (날짜 및 숫자 형태인 경우 통화 녹음으로 간주 및 허용)
+        val nameWithoutExt = displayName.substringBeforeLast('.')
+        val isNumericPattern = nameWithoutExt.matches(Regex("^[0-9_+\\-]+$"))
+        val isDatePattern = nameWithoutExt.matches(Regex(".*\\d{6,8}_\\d{4,6}.*"))
+
+        if (isNumericPattern || isDatePattern) {
+            Log.d(TAG, "[FILTER] Pattern deduction success. Numeric: $isNumericPattern, DatePattern: $isDatePattern for $displayName")
+            return true
+        }
+
+        Log.d(TAG, "[FILTER] File skipped. No criteria matched for: $displayName (Path: $filePath)")
+        return false
+    }
+
     private fun handleFileCreated(directory: String, fileName: String) {
         val fullPath = File(directory, fileName).absolutePath
         Log.d(TAG, "[FILE_OBSERVER] Event CLOSE_WRITE captured. Detected new physical file: $fullPath")
         
-        val extension = fileName.substringAfterLast('.', "").lowercase()
-        val isAudioExtension = extension in arrayOf("m4a", "mp3", "amr", "3gp", "wav", "ogg", "aac", "flac")
-        
-        val isMatch = fileName.contains("Call", ignoreCase = true) || 
-                      fileName.contains("Record", ignoreCase = true) || 
-                      fileName.contains("통화", ignoreCase = true) || 
-                      fileName.contains("녹음", ignoreCase = true) || 
-                      fileName.contains("Voice", ignoreCase = true) || 
-                      fileName.contains("Audio", ignoreCase = true)
-                      
-        if (!isAudioExtension || !isMatch) {
-            Log.d(TAG, "[FILE_OBSERVER] File skipped. Extension check: $isAudioExtension, Keyword match: $isMatch. Path: $fullPath")
+        if (!isTargetCallRecording(fullPath, fileName)) {
             return
         }
         
@@ -307,20 +335,7 @@ class CallRecordingService : Service() {
                     Log.d(TAG, "[SCANNER] Item #$count -> ID: $id, Name: $displayName, Path: $filePath, Age: ${ageSeconds}s, Recent: $isRecent, AlreadyUploaded: $isAlreadyUploaded")
                     
                     if (isRecent && !isAlreadyUploaded) {
-                        // Check broad matching keywords on both path and displayName
-                        if (filePath.contains("Call", ignoreCase = true) || 
-                            filePath.contains("Record", ignoreCase = true) || 
-                            filePath.contains("통화", ignoreCase = true) || 
-                            filePath.contains("녹음", ignoreCase = true) || 
-                            filePath.contains("Voice", ignoreCase = true) || 
-                            filePath.contains("Audio", ignoreCase = true) ||
-                            displayName.contains("Call", ignoreCase = true) ||
-                            displayName.contains("Record", ignoreCase = true) ||
-                            displayName.contains("통화", ignoreCase = true) ||
-                            displayName.contains("녹음", ignoreCase = true) ||
-                            displayName.contains("Voice", ignoreCase = true) ||
-                            displayName.contains("Audio", ignoreCase = true)) {
-                            
+                        if (isTargetCallRecording(filePath, displayName)) {
                             Log.d(TAG, "[SCANNER] [MATCH_SUCCESS] Found new target call recording: $displayName (Path: $filePath)")
                             
                             val contentUri = android.content.ContentUris.withAppendedId(
@@ -339,8 +354,6 @@ class CallRecordingService : Service() {
                             android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
                                 uploadFile(contentUri, displayName, finalFilePath)
                             }, 2000)
-                        } else {
-                            Log.d(TAG, "[SCANNER] Scanned file skipped (does not match naming filter keywords).")
                         }
                     }
                 }
