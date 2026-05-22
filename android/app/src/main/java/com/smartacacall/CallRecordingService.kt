@@ -26,6 +26,52 @@ class CallRecordingService : Service() {
     // 메모리 상에서 현재 진행 중인 업로드 파일들을 추적하여 중복 업로드 방지
     private val currentlyUploadingPaths = HashSet<String>()
 
+    data class UploadTask(
+        val contentUri: android.net.Uri,
+        val displayName: String,
+        val originalPath: String
+    )
+
+    private val uploadQueue = java.util.concurrent.ConcurrentLinkedQueue<UploadTask>()
+    @Volatile
+    private var isUploading = false
+
+    private fun enqueueUpload(contentUri: android.net.Uri, displayName: String, originalPath: String) {
+        val task = UploadTask(contentUri, displayName, originalPath)
+        
+        // 큐에 이미 등록된 동일 경로인지 검사 (중복 방지)
+        val isAlreadyQueued = uploadQueue.any { it.originalPath == originalPath }
+        if (isAlreadyQueued) {
+            Log.d(TAG, "[QUEUE] File already in upload queue: $originalPath")
+            return
+        }
+        
+        currentlyUploadingPaths.add(originalPath)
+        uploadQueue.add(task)
+        Log.d(TAG, "[QUEUE] Enqueued new upload task: $displayName. Queue size: ${uploadQueue.size}")
+        
+        triggerNextUpload()
+    }
+
+    private synchronized fun triggerNextUpload() {
+        if (isUploading) {
+            Log.d(TAG, "[QUEUE] An upload is already active. Waiting for completion...")
+            return
+        }
+        
+        val nextTask = uploadQueue.poll()
+        if (nextTask == null) {
+            Log.d(TAG, "[QUEUE] No more tasks in queue. Going idle.")
+            isUploading = false
+            return
+        }
+        
+        isUploading = true
+        Log.d(TAG, "[QUEUE] Processing next task: ${nextTask.displayName}. Remaining queue size: ${uploadQueue.size}")
+        
+        performUpload(nextTask)
+    }
+
     private val client = OkHttpClient.Builder()
         .connectTimeout(100, TimeUnit.SECONDS)
         .writeTimeout(100, TimeUnit.SECONDS)
@@ -226,7 +272,7 @@ class CallRecordingService : Service() {
             Log.d(TAG, "[MEDIA_SCANNER] Scan completed for path: $scanPath -> Content Uri: $uri")
             if (uri != null) {
                 Log.d(TAG, "[MEDIA_SCANNER] Triggering direct upload with generated Uri.")
-                uploadFile(uri, fileName, scanPath)
+                enqueueUpload(uri, fileName, scanPath)
             } else {
                 Log.e(TAG, "[MEDIA_SCANNER] CRITICAL: Generated Uri is null for $scanPath!")
                 currentlyUploadingPaths.remove(fullPath) // Remove on failure to allow retry
@@ -363,7 +409,7 @@ class CallRecordingService : Service() {
                             Log.d(TAG, "[SCANNER] Waiting 2 seconds for file handles to close before processing upload...")
                             val finalFilePath = filePath
                             android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                                uploadFile(contentUri, displayName, finalFilePath)
+                                enqueueUpload(contentUri, displayName, finalFilePath)
                             }, 2000)
                         }
                     }
@@ -374,7 +420,11 @@ class CallRecordingService : Service() {
         }
     }
 
-    private fun uploadFile(contentUri: android.net.Uri, displayName: String, originalPath: String) {
+    private fun performUpload(task: UploadTask) {
+        val contentUri = task.contentUri
+        val displayName = task.displayName
+        val originalPath = task.originalPath
+
         val extension = displayName.substringAfterLast('.', "m4a")
         val safeFileName = "recording_${System.currentTimeMillis()}.$extension"
 
@@ -395,6 +445,11 @@ class CallRecordingService : Service() {
             }
         } catch (e: Exception) {
             Log.e(TAG, "[UPLOAD] CRITICAL ERROR copying audio stream to cache", e)
+            currentlyUploadingPaths.remove(originalPath)
+            
+            // Proceed to next upload
+            isUploading = false
+            triggerNextUpload()
             return
         }
 
@@ -431,6 +486,10 @@ class CallRecordingService : Service() {
                 } catch (ex: Exception) {
                     Log.w(TAG, "[UPLOAD] Failed to clean up temp file", ex)
                 }
+
+                // Proceed to next upload
+                isUploading = false
+                triggerNextUpload()
             }
 
             override fun onResponse(call: Call, response: Response) {
@@ -467,6 +526,10 @@ class CallRecordingService : Service() {
                 } catch (ex: Exception) {
                     Log.w(TAG, "[UPLOAD] Failed to clean up temp file", ex)
                 }
+
+                // Proceed to next upload
+                isUploading = false
+                triggerNextUpload()
             }
         })
     }
