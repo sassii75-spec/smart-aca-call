@@ -40,7 +40,13 @@ class CallRecordingService : Service() {
         val task = UploadTask(contentUri, displayName, originalPath)
         
         // 큐에 이미 등록된 동일 경로인지 검사 (중복 방지)
-        val isAlreadyQueued = uploadQueue.any { it.originalPath == originalPath }
+        var isAlreadyQueued = false
+        for (queuedTask in uploadQueue) {
+            if (queuedTask.originalPath == originalPath) {
+                isAlreadyQueued = true
+                break
+            }
+        }
         if (isAlreadyQueued) {
             Log.d(TAG, "[QUEUE] File already in upload queue: $originalPath")
             return
@@ -53,23 +59,25 @@ class CallRecordingService : Service() {
         triggerNextUpload()
     }
 
-    private synchronized fun triggerNextUpload() {
-        if (isUploading) {
-            Log.d(TAG, "[QUEUE] An upload is already active. Waiting for completion...")
-            return
+    private fun triggerNextUpload() {
+        synchronized(this) {
+            if (isUploading) {
+                Log.d(TAG, "[QUEUE] An upload is already active. Waiting for completion...")
+                return
+            }
+            
+            val nextTask = uploadQueue.poll()
+            if (nextTask == null) {
+                Log.d(TAG, "[QUEUE] No more tasks in queue. Going idle.")
+                isUploading = false
+                return
+            }
+            
+            isUploading = true
+            Log.d(TAG, "[QUEUE] Processing next task: ${nextTask.displayName}. Remaining queue size: ${uploadQueue.size}")
+            
+            performUpload(nextTask)
         }
-        
-        val nextTask = uploadQueue.poll()
-        if (nextTask == null) {
-            Log.d(TAG, "[QUEUE] No more tasks in queue. Going idle.")
-            isUploading = false
-            return
-        }
-        
-        isUploading = true
-        Log.d(TAG, "[QUEUE] Processing next task: ${nextTask.displayName}. Remaining queue size: ${uploadQueue.size}")
-        
-        performUpload(nextTask)
     }
 
     private val client = OkHttpClient.Builder()
