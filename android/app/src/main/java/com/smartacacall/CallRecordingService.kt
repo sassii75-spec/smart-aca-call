@@ -56,7 +56,10 @@ class CallRecordingService : Service() {
             .build()
 
         // Android 14+ (API 34+) foreground service type requirement
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            Log.d(TAG, "[AGENT_START] Running startForeground with FOREGROUND_SERVICE_TYPE_SPECIAL_USE for API 34+")
+            startForeground(1, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             Log.d(TAG, "[AGENT_START] Running startForeground with FOREGROUND_SERVICE_TYPE_DATA_SYNC for API Q+")
             startForeground(1, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
         } else {
