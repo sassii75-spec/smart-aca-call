@@ -22,10 +22,14 @@ class CallRecordingService : Service() {
     private val CHANNEL_ID = "SmartCallAgentChannel"
     private var fileObservers = mutableListOf<FileObserver>()
     private var pollingTimer: java.util.Timer? = null
+    
+    // 메모리 상에서 현재 진행 중인 업로드 파일들을 추적하여 중복 업로드 방지
+    private val currentlyUploadingPaths = HashSet<String>()
+
     private val client = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
+        .connectTimeout(100, TimeUnit.SECONDS)
+        .writeTimeout(100, TimeUnit.SECONDS)
+        .readTimeout(100, TimeUnit.SECONDS)
         .build()
 
     private var academyId: String = "sa_academy"
@@ -38,6 +42,12 @@ class CallRecordingService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         academyId = intent?.getStringExtra("ACADEMY_ID") ?: "sa_academy"
         Log.d(TAG, "[AGENT_START] onStartCommand started. Academy ID: $academyId")
+        
+        // 이전 빌드에서 타임아웃 실패 등으로 인해 전송 안 된 채 이미 업로드 완료 처리되었던 기록을 초기화하여
+        // v1.0.3 버전 설치 즉시 어제오늘 테스트 통화 내역들이 바로 재수집되어 전송될 수 있도록 초기화
+        val sharedPrefs = getSharedPreferences("SmartCallPrefs", MODE_PRIVATE)
+        sharedPrefs.edit().clear().apply()
+        Log.d(TAG, "[AGENT_START] Cleared old uploaded_files cache in SharedPreferences to trigger backlogs capture.")
         
         val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Smart Call Agent 실행 중")
@@ -194,17 +204,15 @@ class CallRecordingService : Service() {
         val sharedPrefs = getSharedPreferences("SmartCallPrefs", MODE_PRIVATE)
         val uploadedFiles = HashSet(sharedPrefs.getStringSet("uploaded_files", emptySet()) ?: emptySet())
         
-        if (uploadedFiles.contains(fullPath)) {
-            Log.d(TAG, "[FILE_OBSERVER] File already processed and uploaded: $fullPath")
+        if (uploadedFiles.contains(fullPath) || currentlyUploadingPaths.contains(fullPath)) {
+            Log.d(TAG, "[FILE_OBSERVER] File already processed or currently uploading: $fullPath")
             return
         }
         
         Log.d(TAG, "[FILE_OBSERVER] Found target recording: $fileName. Requesting immediate MediaScanner force-scan...")
         
-        // Prevent double upload by logging to SharedPreferences immediately
-        uploadedFiles.add(fullPath)
-        sharedPrefs.edit().putStringSet("uploaded_files", uploadedFiles).apply()
-        Log.d(TAG, "[FILE_OBSERVER] Logged file path to SharedPreferences to block duplicates.")
+        // Mark as currently uploading in memory to prevent duplicate requests
+        currentlyUploadingPaths.add(fullPath)
         
         // Force scan physical file immediately to generate Content Uri
         android.media.MediaScannerConnection.scanFile(
@@ -217,7 +225,8 @@ class CallRecordingService : Service() {
                 Log.d(TAG, "[MEDIA_SCANNER] Triggering direct upload with generated Uri.")
                 uploadFile(uri, fileName, scanPath)
             } else {
-                Log.e(TAG, "[MEDIA_SCANNER] CRITICAL: Generated Uri is null for $scanPath! Fallback ContentObserver will check this later.")
+                Log.e(TAG, "[MEDIA_SCANNER] CRITICAL: Generated Uri is null for $scanPath!")
+                currentlyUploadingPaths.remove(fullPath) // Remove on failure to allow retry
             }
         }
     }
@@ -331,10 +340,11 @@ class CallRecordingService : Service() {
                     // Substantially relax timing filter to 24 hours to handle latency/clock drift, and use Math.abs
                     val isRecent = Math.abs(ageSeconds) < 86400
                     val isAlreadyUploaded = uploadedFiles.contains(filePath)
+                    val isCurrentlyUploading = currentlyUploadingPaths.contains(filePath)
                     
-                    Log.d(TAG, "[SCANNER] Item #$count -> ID: $id, Name: $displayName, Path: $filePath, Age: ${ageSeconds}s, Recent: $isRecent, AlreadyUploaded: $isAlreadyUploaded")
+                    Log.d(TAG, "[SCANNER] Item #$count -> ID: $id, Name: $displayName, Path: $filePath, Age: ${ageSeconds}s, Recent: $isRecent, AlreadyUploaded: $isAlreadyUploaded, CurrentlyUploading: $isCurrentlyUploading")
                     
-                    if (isRecent && !isAlreadyUploaded) {
+                    if (isRecent && !isAlreadyUploaded && !isCurrentlyUploading) {
                         if (isTargetCallRecording(filePath, displayName)) {
                             Log.d(TAG, "[SCANNER] [MATCH_SUCCESS] Found new target call recording: $displayName (Path: $filePath)")
                             
@@ -343,10 +353,8 @@ class CallRecordingService : Service() {
                                 id
                             )
                             
-                            // Prevent double upload by logging to SharedPreferences immediately
-                            uploadedFiles.add(filePath)
-                            sharedPrefs.edit().putStringSet("uploaded_files", uploadedFiles).apply()
-                            Log.d(TAG, "[SCANNER] Saved file to SharedPreferences uploaded set to prevent duplicate uploads.")
+                            // Mark as currently uploading in memory
+                            currentlyUploadingPaths.add(filePath)
                             
                             // Wait 2 seconds to ensure file write is fully completed, then copy and upload
                             Log.d(TAG, "[SCANNER] Waiting 2 seconds for file handles to close before processing upload...")
@@ -409,6 +417,11 @@ class CallRecordingService : Service() {
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
                 Log.e(TAG, "[UPLOAD] NETWORK FAILURE: Upload failed for $safeFileName", e)
+                
+                // Remove from in-memory uploading set so background poller can retry it later
+                currentlyUploadingPaths.remove(originalPath)
+                Log.d(TAG, "[UPLOAD] Removed $originalPath from currentlyUploadingPaths due to network failure.")
+                
                 try {
                     val deleted = tempFile.delete()
                     Log.d(TAG, "[UPLOAD] Cache cleanup: Deleted temp cache file: $deleted")
@@ -421,6 +434,21 @@ class CallRecordingService : Service() {
                 val code = response.code
                 val isSuccess = response.isSuccessful
                 Log.d(TAG, "[UPLOAD] SERVER RESPONSE -> Code: $code, Success: $isSuccess")
+                
+                // Remove from in-memory uploading set
+                currentlyUploadingPaths.remove(originalPath)
+                
+                if (isSuccess) {
+                    // Save to SharedPreferences ONLY when server confirms successful receive and process
+                    val sharedPrefs = getSharedPreferences("SmartCallPrefs", MODE_PRIVATE)
+                    val uploadedFiles = HashSet(sharedPrefs.getStringSet("uploaded_files", emptySet()) ?: emptySet())
+                    uploadedFiles.add(originalPath)
+                    sharedPrefs.edit().putStringSet("uploaded_files", uploadedFiles).apply()
+                    Log.d(TAG, "[UPLOAD] Successfully saved $originalPath to SharedPreferences.")
+                } else {
+                    Log.e(TAG, "[UPLOAD] SERVER ERROR: Response was not successful ($code). File will be allowed to retry.")
+                }
+
                 try {
                     val responseBody = response.body?.string() ?: ""
                     Log.d(TAG, "[UPLOAD] SERVER RESPONSE BODY: $responseBody")
