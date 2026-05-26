@@ -26,6 +26,27 @@ class CallRecordingService : Service() {
     // 메모리 상에서 현재 진행 중인 업로드 파일들을 추적하여 중복 업로드 방지
     private val currentlyUploadingPaths = HashSet<String>()
 
+    // 파일별 업로드 실패 횟수 기록 (최대 3회 제한용)
+    private val uploadRetryMap = HashMap<String, Int>()
+
+    private fun handleUploadFailure(originalPath: String) {
+        val retries = uploadRetryMap[originalPath] ?: 0
+        val nextRetries = retries + 1
+        Log.w(TAG, "[RETRY] Upload failed for $originalPath. Current failure count: $nextRetries")
+        
+        if (nextRetries >= 3) {
+            // 3회 이상 실패 시, 해당 파일을 업로드 완료 목록에 추가하여 무한 전송 시도 방지
+            val sharedPrefs = getSharedPreferences("SmartCallPrefs", MODE_PRIVATE)
+            val uploadedFiles = HashSet(sharedPrefs.getStringSet("uploaded_files", emptySet()) ?: emptySet())
+            uploadedFiles.add(originalPath)
+            sharedPrefs.edit().putStringSet("uploaded_files", uploadedFiles).apply()
+            uploadRetryMap.remove(originalPath)
+            Log.e(TAG, "[RETRY] Max retry count (3) reached. Marked file as ignored to protect Vercel CPU: $originalPath")
+        } else {
+            uploadRetryMap[originalPath] = nextRetries
+        }
+    }
+
     data class UploadTask(
         val contentUri: android.net.Uri,
         val displayName: String,
@@ -97,11 +118,7 @@ class CallRecordingService : Service() {
         academyId = intent?.getStringExtra("ACADEMY_ID") ?: "sa_academy"
         Log.d(TAG, "[AGENT_START] onStartCommand started. Academy ID: $academyId")
         
-        // 이전 빌드에서 타임아웃 실패 등으로 인해 전송 안 된 채 이미 업로드 완료 처리되었던 기록을 초기화하여
-        // v1.0.3 버전 설치 즉시 어제오늘 테스트 통화 내역들이 바로 재수집되어 전송될 수 있도록 초기화
-        val sharedPrefs = getSharedPreferences("SmartCallPrefs", MODE_PRIVATE)
-        sharedPrefs.edit().clear().apply()
-        Log.d(TAG, "[AGENT_START] Cleared old uploaded_files cache in SharedPreferences to trigger backlogs capture.")
+
         
         val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Smart Call Agent 실행 중")
@@ -487,6 +504,7 @@ class CallRecordingService : Service() {
                 // Remove from in-memory uploading set so background poller can retry it later
                 currentlyUploadingPaths.remove(originalPath)
                 Log.d(TAG, "[UPLOAD] Removed $originalPath from currentlyUploadingPaths due to network failure.")
+                handleUploadFailure(originalPath)
                 
                 try {
                     val deleted = tempFile.delete()
@@ -514,9 +532,11 @@ class CallRecordingService : Service() {
                     val uploadedFiles = HashSet(sharedPrefs.getStringSet("uploaded_files", emptySet()) ?: emptySet())
                     uploadedFiles.add(originalPath)
                     sharedPrefs.edit().putStringSet("uploaded_files", uploadedFiles).apply()
+                    uploadRetryMap.remove(originalPath)
                     Log.d(TAG, "[UPLOAD] Successfully saved $originalPath to SharedPreferences.")
                 } else {
                     Log.e(TAG, "[UPLOAD] SERVER ERROR: Response was not successful ($code). File will be allowed to retry.")
+                    handleUploadFailure(originalPath)
                 }
 
                 try {
